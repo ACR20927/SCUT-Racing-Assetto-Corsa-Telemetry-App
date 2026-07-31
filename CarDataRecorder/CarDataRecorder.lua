@@ -96,6 +96,18 @@ local function startRecording()
   csvFile:write('"TorqueRR",')
   csvFile:write('"TorqueLR",')
   csvFile:write('"TorqueRF",')
+  csvFile:write('"FxLF",')
+  csvFile:write('"FxRF",')
+  csvFile:write('"FxLR",')
+  csvFile:write('"FxRR",')
+  csvFile:write('"FyLF",')
+  csvFile:write('"FyRF",')
+  csvFile:write('"FyLR",')
+  csvFile:write('"FyRR",')
+  csvFile:write('"LoadLF",')
+  csvFile:write('"LoadRF",')
+  csvFile:write('"LoadLR",')
+  csvFile:write('"LoadRR",')
   csvFile:write('"Motor_Ctrl_mode",')
   csvFile:write('"Real_Yawrate",')
   csvFile:write('"Ideal_Yawrate"')
@@ -105,7 +117,7 @@ local function startRecording()
   --下面放要传输的数据单位
   
   csvFile:write('"s","km/h","deg","%","%","%",')
-  csvFile:write('"m","m","m","g","g","g","N/m","N/m","N/m","N/m"," ","rad","rad"\n\n')
+  csvFile:write('"m","m","m","g","g","g","N/m","N/m","N/m","N/m","N","N","N","N","N","N","N","N","N","N","N","N"," ","rad","rad"\n\n')
 
   --上面放要传输的数据单位
 
@@ -203,6 +215,16 @@ function script.windowMain(dt)
         local accX = acc.z
         csvFile:write(string.format('%.3f,%.3f,%.3f,', accX, accY, accZ))
         csvFile:write(string.format('%.3f,%.3f,%.3f,%.3f,', torqueLF, torqueRF, torqueLR, torqueRR))
+        local wheels = car.wheels or {}
+        local w0, w1, w2, w3 = wheels[0], wheels[1], wheels[2], wheels[3]
+        local fxLF, fyLF, loadLF = w0 and w0.fx or 0, w0 and w0.fy or 0, w0 and w0.load or 0
+        local fxRF, fyRF, loadRF = w1 and w1.fx or 0, w1 and w1.fy or 0, w1 and w1.load or 0
+        local fxLR, fyLR, loadLR = w2 and w2.fx or 0, w2 and w2.fy or 0, w2 and w2.load or 0
+        local fxRR, fyRR, loadRR = w3 and w3.fx or 0, w3 and w3.fy or 0, w3 and w3.load or 0
+        csvFile:write(string.format('%.3f,%.3f,%.3f,', fxLF, fyLF, loadLF))
+        csvFile:write(string.format('%.3f,%.3f,%.3f,', fxRF, fyRF, loadRF))
+        csvFile:write(string.format('%.3f,%.3f,%.3f,', fxLR, fyLR, loadLR))
+        csvFile:write(string.format('%.3f,%.3f,%.3f,', fxRR, fyRR, loadRR))
         csvFile:write(string.format('%s,', motor_ctrl_mode))
         csvFile:write(string.format('%.3f,%.3f,', real_yawrate, ideal_yawrate))
 
