@@ -9,6 +9,7 @@ local filePath = nil
 local sample_rate=50
 local sample_interval = 1/sample_rate
 local torqueLF, torqueRF, torqueLR, torqueRR = 0, 0, 0, 0
+local calcFyLF, calcFyRF, calcFyLR, calcFyRR = 0, 0, 0, 0
 local motor_ctrl_mode=nil
 local real_yawrate, ideal_yawrate = 0, 0
 
@@ -46,6 +47,9 @@ local function startRecording()
     end)
   ac.onSharedEvent('ideal_yawrate', function(data, senderName, senderType, senderID)
     ideal_yawrate = data or "Unknown"
+    end)
+  ac.onSharedEvent('Fy', function(data, senderName, senderType, senderID)
+    calcFyLF, calcFyRF, calcFyLR, calcFyRR = data[1], data[2], data[3], data[4]
     end)
   local docsPath = getDocumentsPath()
   if not docsPath then
@@ -108,6 +112,10 @@ local function startRecording()
   csvFile:write('"LoadRF",')
   csvFile:write('"LoadLR",')
   csvFile:write('"LoadRR",')
+  csvFile:write('"FyCalcLF",')
+  csvFile:write('"FyCalcRF",')
+  csvFile:write('"FyCalcLR",')
+  csvFile:write('"FyCalcRR",')
   csvFile:write('"Motor_Ctrl_mode",')
   csvFile:write('"Real_Yawrate",')
   csvFile:write('"Ideal_Yawrate"')
@@ -117,7 +125,7 @@ local function startRecording()
   --下面放要传输的数据单位
   
   csvFile:write('"s","km/h","deg","%","%","%",')
-  csvFile:write('"m","m","m","g","g","g","N/m","N/m","N/m","N/m","N","N","N","N","N","N","N","N","N","N","N","N"," ","rad","rad"\n\n')
+  csvFile:write('"m","m","m","g","g","g","N/m","N/m","N/m","N/m","N","N","N","N","N","N","N","N","N","N","N","N","N","N","N","N"," ","rad","rad"\n\n')
 
   --上面放要传输的数据单位
 
@@ -225,6 +233,7 @@ function script.windowMain(dt)
         csvFile:write(string.format('%.3f,%.3f,%.3f,', fxRF, fyRF, loadRF))
         csvFile:write(string.format('%.3f,%.3f,%.3f,', fxLR, fyLR, loadLR))
         csvFile:write(string.format('%.3f,%.3f,%.3f,', fxRR, fyRR, loadRR))
+        csvFile:write(string.format('%.3f,%.3f,%.3f,%.3f,', calcFyLF, calcFyRF, calcFyLR, calcFyRR))
         csvFile:write(string.format('%s,', motor_ctrl_mode))
         csvFile:write(string.format('%.3f,%.3f,', real_yawrate, ideal_yawrate))
 
