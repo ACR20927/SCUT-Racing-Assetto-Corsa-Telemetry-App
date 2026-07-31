@@ -2,12 +2,12 @@
 local recording = false
 local csvFile = nil
 local dataCount = 0
-local current_time = 0
 local start_time = 0
+local next_sample_time = 0
 local filePath = nil
 
 local sample_rate=50
-local sample_count=0
+local sample_interval = 1/sample_rate
 local torqueLF, torqueRF, torqueLR, torqueRR = 0, 0, 0, 0
 local motor_ctrl_mode=nil
 local real_yawrate, ideal_yawrate = 0, 0
@@ -112,8 +112,8 @@ local function startRecording()
   csvFile:flush()
   recording = true
   dataCount = 0
-  current_time = 0
   start_time = os.clock()
+  next_sample_time = start_time + sample_interval
   ac.log('Car Data Recorder: Recording started - ' .. filePath)
   return true
 end
@@ -173,13 +173,14 @@ function script.windowMain(dt)
     
 
   if recording and csvFile then
-    if sample_count>=1/sample_rate then
-      sample_count=0
+    local now = os.clock()
+    if now >= next_sample_time then
+      next_sample_time = next_sample_time + sample_interval
       local car = ac.getCar(0)
       if car then
 
         --下面放要传输的数据
-        current_time = current_time + dt
+        local current_time = now - start_time
         csvFile:write(string.format('%.3f,', current_time))
         local vehspd = car.speedKmh or 0
         csvFile:write(string.format('%.3f,', vehspd))
@@ -210,8 +211,6 @@ function script.windowMain(dt)
         csvFile:flush()
         dataCount = dataCount + 1
       end
-    else
-      sample_count=sample_count+dt
     end
   end
 end
