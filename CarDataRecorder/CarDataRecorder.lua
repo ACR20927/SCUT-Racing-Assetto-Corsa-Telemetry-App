@@ -1,165 +1,251 @@
-
 local recording = false
 local csvFile = nil
 local dataCount = 0
-local start_time = 0
-local next_sample_time = 0
+local elapsed = 0
+local nextSampleIndex = 1
+local missedSamples = 0
+local lastPhysicsTimestamp = nil
+local lastFlushTime = 0
 local filePath = nil
+local lastError = nil
 
-local sample_rate=50
-local sample_interval = 1/sample_rate
-local torqueLF, torqueRF, torqueLR, torqueRR = 0, 0, 0, 0
-local calcFyLF, calcFyRF, calcFyLR, calcFyRR = 0, 0, 0, 0
-local motor_ctrl_mode=nil
-local real_yawrate, ideal_yawrate = 0, 0
+local sampleRate = 50
+local sampleInterval = 1 / sampleRate
+local telemetryTimeout = 0.5
+local telemetry = {}
+local eventNames = {'Torque', 'motor_ctrl_mode', 'real_yawrate', 'ideal_yawrate', 'Fy'}
 
-local function getDocumentsPath()
-  local userProfile = os.getenv('USERPROFILE')
-  if userProfile then
-    local path = userProfile .. '\\Documents\\Assetto Corsa'
-    os.execute('mkdir "' .. path .. '" 2>nul')
-    return path
+local function finiteNumber(value)
+  if type(value) ~= 'number' or value ~= value or value == math.huge or value == -math.huge then
+    return nil
   end
-  return nil
+  return value
 end
 
-local function getTimestamp()
-  return os.date('%Y%m%d_%H%M%S')
+local function scale(value, multiplier)
+  local number = finiteNumber(value)
+  return number and number * multiplier or nil
 end
 
-local function getDateTime()
-  return os.date('%Y-%m-%d %H:%M:%S')
+-- Subscribe once per app lifetime, not once per recording. Missing values stay missing.
+for i = 1, #eventNames do
+  local eventName = eventNames[i]
+  ac.onSharedEvent(eventName, function(data)
+    local values = {}
+    if eventName == 'Torque' or eventName == 'Fy' then
+      if type(data) == 'table' then
+        for wheel = 1, 4 do values[wheel] = finiteNumber(data[wheel]) end
+      end
+    else
+      values[1] = finiteNumber(data)
+    end
+    telemetry[eventName] = {values = values, receivedAt = os.preciseClock()}
+  end)
 end
 
-local function getCurrentTime()
-  return os.time()
+local function receivedValues(eventName, now)
+  local entry = telemetry[eventName]
+  if entry and now - entry.receivedAt <= telemetryTimeout then
+    return entry.values
+  end
+  return {}
+end
+
+local function missingTelemetry(now)
+  local missing = {}
+  for i = 1, #eventNames do
+    local name = eventNames[i]
+    local values = receivedValues(name, now)
+    local count = (name == 'Torque' or name == 'Fy') and 4 or 1
+    for j = 1, count do
+      if values[j] == nil then
+        missing[#missing + 1] = name
+        break
+      end
+    end
+  end
+  return table.concat(missing, ', ')
+end
+
+-- Header and units share one schema. Wheel ordering is LF, RF, LR, RR throughout.
+local columns = {
+  {'Time', 's'}, {'Speed', 'km/h'}, {'Steer', 'deg'},
+  {'Throttle', '%'}, {'Brake', '%'}, {'Clutch', '%'},
+  {'Pos_X', 'm'}, {'Pos_Y', 'm'}, {'Pos_Z', 'm'},
+  {'Acc_X', 'g'}, {'Acc_Y', 'g'}, {'Acc_Z', 'g'},
+  {'TorqueLF', 'N*m'}, {'TorqueRF', 'N*m'}, {'TorqueLR', 'N*m'}, {'TorqueRR', 'N*m'},
+  {'FxLF', 'N'}, {'FxRF', 'N'}, {'FxLR', 'N'}, {'FxRR', 'N'},
+  {'FyLF', 'N'}, {'FyRF', 'N'}, {'FyLR', 'N'}, {'FyRR', 'N'},
+  {'LoadLF', 'N'}, {'LoadRF', 'N'}, {'LoadLR', 'N'}, {'LoadRR', 'N'},
+  {'FyCalcLF', 'N'}, {'FyCalcRF', 'N'}, {'FyCalcLR', 'N'}, {'FyCalcRR', 'N'},
+  {'Motor_Ctrl_mode', ''}, {'Real_Yawrate', 'rad/s'}, {'Ideal_Yawrate', 'rad/s'}
+}
+
+local function quoteCSV(value)
+  return '"' .. tostring(value or ''):gsub('"', '""'):gsub('[\r\n]', ' ') .. '"'
+end
+
+local function fileOperation(file, method, ...)
+  local ok, result, err = pcall(file[method], file, ...)
+  if not ok then return false, tostring(result) end
+  if not result then return false, tostring(err or (method .. ' failed')) end
+  return true
+end
+
+local function reportError(message)
+  lastError = message
+  ac.log('Car Data Recorder: ERROR: ' .. message)
+  ac.setMessage('Car Data Recorder', message)
+end
+
+local function closeRecording()
+  local file = csvFile
+  csvFile = nil
+  recording = false
+  if not file then return true end
+  local flushed, flushError = fileOperation(file, 'flush')
+  local closed, closeError = fileOperation(file, 'close')
+  if not flushed or not closed then
+    local err = flushError or closeError
+    reportError(err)
+    return false, err
+  end
+  ac.log(string.format('Car Data Recorder: stopped; %d rows, %d missed slots - %s',
+    dataCount, missedSamples, filePath or ''))
+  return true
+end
+
+local function writeText(text)
+  local ok, err = fileOperation(csvFile, 'write', text)
+  if not ok then
+    closeRecording()
+    reportError('CSV write failed: ' .. err)
+  end
+  return ok, err
+end
+
+local function buildHeader()
+  local carName = ac.getCarName(0) or 'Unknown'
+  local metadata = {
+    {'Format', 'AiM CSV File'}, {'Session', 'Unknown'}, {'Vehicle', carName},
+    {'Racer', os.getenv('USERNAME') or 'Unknown'}, {'Championship', ''},
+    {'Comment', 'Target 50 Hz; frame-driven, actual Time is irregular; no catch-up samples. '
+      .. 'Torque is motor-shaft command. Blank means unavailable. Pos is world XYZ in metres. '
+      .. 'Acc XYZ is longitudinal/lateral/vertical in g.'},
+    {'Date', os.date('%Y-%m-%d')}, {'Time', os.date('%H:%M:%S')},
+    {'Sample Rate', sampleRate}, {'Duration', 'Unknown'},
+    {'Beacon Markers', 'Unknown'}, {'Segment Times', 'Unknown'}
+  }
+  local lines = {}
+  for i = 1, #metadata do
+    lines[#lines + 1] = quoteCSV(metadata[i][1]) .. ',' .. quoteCSV(metadata[i][2])
+  end
+  lines[#lines + 1] = ''
+  local names, units = {}, {}
+  for i = 1, #columns do
+    names[i], units[i] = quoteCSV(columns[i][1]), quoteCSV(columns[i][2])
+  end
+  lines[#lines + 1] = table.concat(names, ',')
+  lines[#lines + 1] = table.concat(units, ',')
+  return table.concat(lines, '\n') .. '\n\n'
 end
 
 local function startRecording()
-  ac.onSharedEvent('Torque', function(data, senderName, senderType, senderID)
-    torqueLF, torqueRF, torqueLR, torqueRR = data[1], data[2], data[3], data[4]
-    end)
-  ac.onSharedEvent('motor_ctrl_mode', function(data, senderName, senderType, senderID)
-    motor_ctrl_mode = data
-    end)
-  ac.onSharedEvent('real_yawrate', function(data, senderName, senderType, senderID)
-    real_yawrate = data
-    end)
-  ac.onSharedEvent('ideal_yawrate', function(data, senderName, senderType, senderID)
-    ideal_yawrate = data or "Unknown"
-    end)
-  ac.onSharedEvent('Fy', function(data, senderName, senderType, senderID)
-    calcFyLF, calcFyRF, calcFyLR, calcFyRR = data[1], data[2], data[3], data[4]
-    end)
-  local docsPath = getDocumentsPath()
-  if not docsPath then
-    ac.log('ERROR: Could not find Documents path')
-    return false, 'No Documents path'
+  if recording then return true end
+  local docsPath = ac.getFolder(ac.FolderID.ACDocuments)
+  if not docsPath or docsPath == '' then return false, 'Could not find Assetto Corsa Documents folder' end
+  if not io.dirExists(docsPath) and not io.createDir(docsPath) then
+    return false, 'Could not create Documents folder: ' .. docsPath
   end
-  local timestamp = getTimestamp()
-  filePath = docsPath .. '\\car_data_' .. timestamp .. '.csv'
-  csvFile = io.open(filePath, 'w')
-  if not csvFile then
-    ac.log('ERROR: Could not create CSV file: ' .. filePath)
-    return false, 'File creation failed'
+  local base = docsPath .. '\\car_data_' .. os.date('%Y%m%d_%H%M%S')
+  local candidate, suffix = base .. '.csv', 0
+  while io.exists(candidate) do
+    suffix = suffix + 1
+    candidate = base .. '_' .. suffix .. '.csv'
   end
-  csvFile:write('"Format","AiM CSV File"\n')
-  csvFile:write('"Session","Unknown"\n')
-  local carName = ac.getCarName(0) or 'Unknown' 
-  csvFile:write('"Vehicle","' .. carName .. '"\n')
-  local driverName = os.getenv('USERNAME') or 'Unknown'
-  csvFile:write('"Racer","' .. driverName .. '"\n')
-  csvFile:write('"Championship",""\n')
-  csvFile:write('"Comment",""\n')
-    local dateTime = getDateTime()
-    csvFile:write('"Date","' .. dateTime .. '"\n')
-  local timeStr = os.date('%H:%M:%S')
-  csvFile:write('"Time","' .. timeStr .. '"\n')
-  csvFile:write('"Sample Rate","' .. sample_rate .. '"\n')
-  csvFile:write('"Duration","Unknown"\n')
-  csvFile:write('"Session","Unknown"\n')
-  csvFile:write('"Beacon Markers","Unknown"\n')
-  csvFile:write('"Segment Times","Unknown"\n')
-  csvFile:write('\n')
-
-  --下面放要传输的数据标题
-
-  csvFile:write('"Time",')
-  csvFile:write('"Speed",')
-  csvFile:write('"Steer",')
-  csvFile:write('"Throttle",')
-  csvFile:write('"Brake",')
-  csvFile:write('"Clutch",')
-  csvFile:write('"GPS Latitude",')
-  csvFile:write('"GPS Longitude",')
-  csvFile:write('"Pos_Z",')
-  csvFile:write('"Acc_X",')
-  csvFile:write('"Acc_Y",')
-  csvFile:write('"Acc_Z",')
-  csvFile:write('"TorqueLF",')
-  csvFile:write('"TorqueRR",')
-  csvFile:write('"TorqueLR",')
-  csvFile:write('"TorqueRF",')
-  csvFile:write('"FxLF",')
-  csvFile:write('"FxRF",')
-  csvFile:write('"FxLR",')
-  csvFile:write('"FxRR",')
-  csvFile:write('"FyLF",')
-  csvFile:write('"FyRF",')
-  csvFile:write('"FyLR",')
-  csvFile:write('"FyRR",')
-  csvFile:write('"LoadLF",')
-  csvFile:write('"LoadRF",')
-  csvFile:write('"LoadLR",')
-  csvFile:write('"LoadRR",')
-  csvFile:write('"FyCalcLF",')
-  csvFile:write('"FyCalcRF",')
-  csvFile:write('"FyCalcLR",')
-  csvFile:write('"FyCalcRR",')
-  csvFile:write('"Motor_Ctrl_mode",')
-  csvFile:write('"Real_Yawrate",')
-  csvFile:write('"Ideal_Yawrate"')
-
-  --上面放要传输的数据标题
-  csvFile:write('\n')
-  --下面放要传输的数据单位
-  
-  csvFile:write('"s","km/h","deg","%","%","%",')
-  csvFile:write('"m","m","m","g","g","g","N/m","N/m","N/m","N/m","N","N","N","N","N","N","N","N","N","N","N","N","N","N","N","N"," ","rad","rad"\n\n')
-
-  --上面放要传输的数据单位
-
-  csvFile:flush()
+  local file, err = io.open(candidate, 'w')
+  if not file then return false, 'Could not create CSV: ' .. tostring(err) end
+  csvFile, filePath = file, candidate
+  dataCount, elapsed, nextSampleIndex, missedSamples = 0, 0, 1, 0
+  lastPhysicsTimestamp, lastFlushTime, lastError = nil, 0, nil
+  telemetry = {}
+  if not writeText(buildHeader()) then return false, lastError end
+  local flushed, flushError = fileOperation(csvFile, 'flush')
+  if not flushed then
+    closeRecording()
+    return false, 'Could not flush CSV header: ' .. flushError
+  end
   recording = true
-  dataCount = 0
-  start_time = os.clock()
-  next_sample_time = start_time + sample_interval
   ac.log('Car Data Recorder: Recording started - ' .. filePath)
   return true
 end
 
-
-local function stopRecording()
-  if csvFile then
-    csvFile:close()
-    recording = false
-    ac.log('Car Data Recorder: Recording stopped')
+local function sampleCar(car, sampleTime)
+  local fields = {}
+  local function append(value)
+    local number = finiteNumber(value)
+    fields[#fields + 1] = number and string.format('%.6f', number) or ''
   end
-end
-
-
-local function onStartButtonClicked()
-  if not recording then
-    local ok, err = startRecording()
-    if not ok then
-      ac.setMessage('Car Data Recorder', 'Failed to start: ' .. (err or 'Unknown error'))
+  append(sampleTime)
+  append(car.speedKmh)
+  append(scale(car.steer, -1))  -- Preserve the ECU's steering sign convention.
+  append(scale(car.gas, 100))
+  append(scale(car.brake, 100))
+  append(scale(car.clutch, 100))
+  local pos = car.position
+  append(pos and pos.x)
+  append(pos and pos.y)
+  append(pos and pos.z)
+  local acc = car.acceleration
+  append(acc and acc.z)  -- Longitudinal, lateral, vertical (already measured in g).
+  append(acc and acc.x)
+  append(acc and acc.y)
+  local now = os.preciseClock()
+  local torque = receivedValues('Torque', now)
+  for i = 1, 4 do append(torque[i]) end
+  local wheels = car.physicsAvailable and car.wheels or nil
+  for _, key in ipairs({'fx', 'fy', 'load'}) do
+    for i = 0, 3 do
+      local wheel = wheels and wheels[i]
+      append(wheel and wheel[key])
     end
   end
+  local calcFy = receivedValues('Fy', now)
+  for i = 1, 4 do append(calcFy[i]) end
+  append(receivedValues('motor_ctrl_mode', now)[1])
+  append(receivedValues('real_yawrate', now)[1])
+  append(receivedValues('ideal_yawrate', now)[1])
+  return table.concat(fields, ',') .. '\n'
 end
 
-local function onStopButtonClicked()
-  if recording then
-    stopRecording()
+-- Sampling is independent of UI visibility. Do not fabricate multiple rows from one frame.
+function script.update(dt)
+  if not recording or not csvFile then return end
+  local sim = ac.getSim()
+  if not sim.isLive then return end
+  local simDt = finiteNumber(sim.dt)
+  if not simDt or simDt <= 0 then return end
+  elapsed = elapsed + simDt
+  local dueIndex = math.floor(elapsed / sampleInterval + 1e-7)
+  if dueIndex < nextSampleIndex then return end
+  local car = ac.getCar(0)
+  if not car then return end
+  local timestamp = finiteNumber(car.timestamp)
+  if timestamp and timestamp > 0 and timestamp == lastPhysicsTimestamp then return end
+  if not writeText(sampleCar(car, elapsed)) then return end
+  missedSamples = missedSamples + dueIndex - nextSampleIndex
+  nextSampleIndex = dueIndex + 1
+  lastPhysicsTimestamp = timestamp
+  dataCount = dataCount + 1
+  -- Buffer rows, with a periodic flush and a final flush when stopped or unloaded.
+  if elapsed - lastFlushTime >= 1 then
+    local ok, err = fileOperation(csvFile, 'flush')
+    if not ok then
+      closeRecording()
+      reportError('CSV flush failed: ' .. err)
+      return
+    end
+    lastFlushTime = elapsed
   end
 end
 
@@ -169,79 +255,33 @@ function script.windowMain(dt)
   ui.tabBar('cdr_tabs', ui.TabBarFlags.IntegratedTabs, function()
     ui.tabItem('Recorder', function()
       ui.pushFont(ui.Font.Main)
+      ui.text(recording and 'Status: RECORDING' or 'Status: Ready')
+      ui.text('Records: ' .. tostring(dataCount))
+      ui.text(string.format('Target: %d Hz | Average: %.2f Hz', sampleRate,
+        elapsed > 0 and dataCount / elapsed or 0))
+      ui.text('Missed sample slots: ' .. tostring(missedSamples))
+      ui.text('File: ' .. (filePath and filePath:match('[^\\/]*$') or ''))
+      if lastError then ui.textWrapped('Error: ' .. lastError) end
       if recording then
-        ui.text('Status: RECORDING')
-        ui.text('Records: ' .. tostring(dataCount))
-        ui.text('File: ' .. (filePath and filePath:match('[^\\/]*$') or ''))
-        if ui.button('Stop Recording', vec2(-0.1, 0)) then
-          stopRecording()
-        end
-      else
-        ui.text('Status: Ready')
-        ui.text('Records: ' .. tostring(dataCount))
-        ui.text('File: ' .. (filePath and filePath:match('[^\\/]*$') or ''))
-        if ui.button('Start Recording', vec2(-0.1, 0)) then
-          onStartButtonClicked()
-        end
+        local missing = missingTelemetry(os.preciseClock())
+        if missing ~= '' then ui.textWrapped('Unavailable (CSV blank): ' .. missing) end
+        ui.textWrapped('Recording continues when this window is closed. Stop here to finish the file.')
+        if ui.button('Stop Recording', vec2(-0.1, 0)) then closeRecording() end
+      elseif ui.button('Start Recording', vec2(-0.1, 0)) then
+        local ok, err = startRecording()
+        if not ok then reportError('Failed to start: ' .. tostring(err)) end
       end
       ui.popFont()
     end)
     ui.tabItem('About', function()
-      ui.textWrapped('This app records car telemetry data (speed, throttle, brake, GPS, acceleration) to a CSV file in your Documents/Assetto Corsa folder.\n\nInspired by CarMirrorsConfigurator app UI structure.')
+      ui.textWrapped('Records player car telemetry to Documents/Assetto Corsa. '
+        .. 'Target is 50 Hz, limited by rendered frames; actual sample times are in Time. '
+        .. 'Paused simulation and replays are not recorded. Missing or stale custom data is blank. '
+        .. 'Torque is the motor-shaft command, not actual wheel torque. '
+        .. 'Position is world XYZ, not GPS. Acc XYZ is longitudinal/lateral/vertical in g. '
+        .. 'FyCalc is optional: columns stay blank when the ECU does not provide those estimates.')
     end)
   end)
-    
-
-  if recording and csvFile then
-    local now = os.clock()
-    if now >= next_sample_time then
-      next_sample_time = next_sample_time + sample_interval
-      local car = ac.getCar(0)
-      if car then
-
-        --下面放要传输的数据
-        local current_time = now - start_time
-        csvFile:write(string.format('%.3f,', current_time))
-        local vehspd = car.speedKmh or 0
-        csvFile:write(string.format('%.3f,', vehspd))
-        local steer = -car.steer or 0
-        csvFile:write(string.format('%.3f,', steer))
-        local throttle = car.gas*100 or 0
-        csvFile:write(string.format('%.3f,', throttle))
-        local brake = car.brake*100 or 0
-        csvFile:write(string.format('%.3f,', brake))
-        local clutch = car.clutch*100 or 0
-        csvFile:write(string.format('%.3f,', clutch))
-        local pos = car.position or vec3(0, 0, 0)
-        local lat = pos.x
-        local lon = pos.z
-        local posZ = pos.y
-        csvFile:write(string.format('%.3f,%.3f,%.3f,', lat, lon, posZ))
-        local acc = car.acceleration or vec3(0, 0, 0)
-        local accY = acc.x
-        local accZ = acc.y
-        local accX = acc.z
-        csvFile:write(string.format('%.3f,%.3f,%.3f,', accX, accY, accZ))
-        csvFile:write(string.format('%.3f,%.3f,%.3f,%.3f,', torqueLF, torqueRF, torqueLR, torqueRR))
-        local wheels = car.wheels or {}
-        local w0, w1, w2, w3 = wheels[0], wheels[1], wheels[2], wheels[3]
-        local fxLF, fyLF, loadLF = w0 and w0.fx or 0, w0 and w0.fy or 0, w0 and w0.load or 0
-        local fxRF, fyRF, loadRF = w1 and w1.fx or 0, w1 and w1.fy or 0, w1 and w1.load or 0
-        local fxLR, fyLR, loadLR = w2 and w2.fx or 0, w2 and w2.fy or 0, w2 and w2.load or 0
-        local fxRR, fyRR, loadRR = w3 and w3.fx or 0, w3 and w3.fy or 0, w3 and w3.load or 0
-        csvFile:write(string.format('%.3f,%.3f,%.3f,', fxLF, fyLF, loadLF))
-        csvFile:write(string.format('%.3f,%.3f,%.3f,', fxRF, fyRF, loadRF))
-        csvFile:write(string.format('%.3f,%.3f,%.3f,', fxLR, fyLR, loadLR))
-        csvFile:write(string.format('%.3f,%.3f,%.3f,', fxRR, fyRR, loadRR))
-        csvFile:write(string.format('%.3f,%.3f,%.3f,%.3f,', calcFyLF, calcFyRF, calcFyLR, calcFyRR))
-        csvFile:write(string.format('%s,', motor_ctrl_mode))
-        csvFile:write(string.format('%.3f,%.3f,', real_yawrate, ideal_yawrate))
-
-        --上面放要传输的数据
-        csvFile:write('\n')
-        csvFile:flush()
-        dataCount = dataCount + 1
-      end
-    end
-  end
 end
+
+ac.onRelease(function() closeRecording() end)
