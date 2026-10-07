@@ -150,7 +150,8 @@ local function safeField(definition, id)
 end
 
 local function groupNames(name)
-  return {name, name .. '__type', name .. '__received_wall_s', name .. '__updates'}
+  -- The journal still keeps all diagnostic metadata; CSV exposes values only.
+  return {name}
 end
 
 local function sameField(a, b)
@@ -284,7 +285,7 @@ function Session:addField(definition)
     end
     if free then break end
     suffix = suffix + 1
-    field.name = originalName .. '__field' .. suffix
+    field.name = originalName .. '__source' .. (suffix + 1)
   end
   -- Schema must be written before the first sample referencing its field ID.
   local ok, writeErr = self:_writeRecord({type = 'field', field = field})
@@ -345,11 +346,12 @@ end
 
 function Session:_writeCSVHeader()
   local metadata = self.metadata
-  local comment = 'Target ' .. tostring(metadata.sampleRate) .. ' Hz; frame-driven irregular simulation Time; '
+  local comment = 'Target ' .. tostring(metadata.sampleRate) .. ' Hz; frame-driven irregular simulation '
+    .. self.baseColumns[1].name .. '; '
     .. 'no fabricated catch-up rows. Dynamic values are arrivals since the preceding sample, not held values. '
-    .. 'Blank/type=missing means no value arrived; received_wall_s is receiver wall-clock seconds since recording start, '
-    .. 'not ECU generation time. '
-    .. 'updates counts arrivals since the preceding sample. Custom value types and names are preserved; no assumed units. '
+    .. 'CSV contains one value column per channel; missing or nil values are blank, true zero remains zero. '
+    .. 'Types, receiver wall-clock timestamps, per-field arrival counts and sender identities are retained in the journal. '
+    .. 'Receiver timestamps are not ECU generation times. Unknown custom units are unspecified. '
     .. 'Pos is world XYZ in metres. Acc XYZ is longitudinal/lateral/vertical in g. '
     .. 'All dynamic fields discovered during this recording are included in this header.'
   if self.recoveryNotice then comment = comment .. ' ' .. self.recoveryNotice end
@@ -367,12 +369,9 @@ function Session:_writeCSVHeader()
     names[#names + 1], units[#units + 1] = self.baseColumns[i].name, self.baseColumns[i].unit
   end
   for i = 1, #self.fields do
-    local field, group = self.fields[i], groupNames(self.fields[i].name)
-    for j = 1, 4 do names[#names + 1] = group[j] end
+    local field = self.fields[i]
+    names[#names + 1] = field.name
     units[#units + 1] = field.unit
-    units[#units + 1] = ''
-    units[#units + 1] = 's'
-    units[#units + 1] = 'count'
   end
   lines[#lines + 1] = csvLine(names)
   lines[#lines + 1] = csvLine(units)
@@ -495,9 +494,6 @@ function Session:_consumeRecord(record)
       for i = 1, #self.fields do
         local value = record.custom[tostring(i)]
         values[#values + 1] = value and value.value or ''
-        values[#values + 1] = value and value.kind or 'missing'
-        values[#values + 1] = value and value.received or ''
-        values[#values + 1] = value and value.updates or '0'
       end
       local ok, writeErr = fileCall(self._output, 'write', csvLine(values))
       if not ok then return false, 'CSV row write failed: ' .. writeErr end

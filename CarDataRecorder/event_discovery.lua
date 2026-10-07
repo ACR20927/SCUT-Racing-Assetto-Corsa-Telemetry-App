@@ -2,7 +2,7 @@
 -- CSP has no documented wildcard subscription, so runtime-generated names cannot
 -- be inferred here. Payload fields are handled separately by the recorder.
 local module = {}
-local FALLBACK_EVENTS = {'Torque', 'motor_ctrl_mode', 'real_yawrate', 'ideal_yawrate', 'Fy'}
+local FALLBACK_EVENTS = {'VehicleTelemetry', 'Torque', 'motor_ctrl_mode', 'real_yawrate', 'ideal_yawrate', 'Fy'}
 local SCAN_INTERVAL = 1
 local FILES_PER_UPDATE = 4
 local MAX_DIRECTORY_DEPTH = 16

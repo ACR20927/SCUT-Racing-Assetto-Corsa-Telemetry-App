@@ -1,10 +1,13 @@
 local EventDiscovery = require('event_discovery')
 local TelemetryFields = require('telemetry_fields')
 local CsvSession = require('csv_session')
+local Channels = require('telemetry_channels')
+local TelemetryNames = require('telemetry_names')
 
 local session = nil
 local pending = {}
 local fieldIDs = {}
+local knownSources = {}
 local elapsed = 0
 local nextSampleIndex = 1
 local missedSamples = 0
@@ -16,15 +19,7 @@ local sampleRate = 50
 local sampleInterval = 1 / sampleRate
 
 -- Native data remains available even for cars without a telemetry sender.
-local baseColumns = {
-  {'Time', 's'}, {'Speed', 'km/h'}, {'Steer', 'deg'},
-  {'Throttle', '%'}, {'Brake', '%'}, {'Clutch', '%'},
-  {'Pos_X', 'm'}, {'Pos_Y', 'm'}, {'Pos_Z', 'm'},
-  {'Acc_X', 'g'}, {'Acc_Y', 'g'}, {'Acc_Z', 'g'},
-  {'FxLF', 'N'}, {'FxRF', 'N'}, {'FxLR', 'N'}, {'FxRR', 'N'},
-  {'FyLF', 'N'}, {'FyRF', 'N'}, {'FyLR', 'N'}, {'FyRR', 'N'},
-  {'LoadLF', 'N'}, {'LoadRF', 'N'}, {'LoadLR', 'N'}, {'LoadRR', 'N'}
-}
+local baseColumns = Channels.baseColumns
 
 local function finiteNumber(value)
   if type(value) ~= 'number' or value ~= value or value == math.huge or value == -math.huge then
@@ -64,12 +59,29 @@ local function sessionOptions()
     carName = ac.getCarName(0) or 'Unknown', driverName = os.getenv('USERNAME') or 'Unknown'}
 end
 
--- Units are optional. New fields are recorded without inventing their physical units.
-local function knownUnit(eventName, path)
-  if eventName == 'Torque' and path:match('^%[%d+%]$') then return 'N*m' end
-  if eventName == 'Fy' and path:match('^%[%d+%]$') then return 'N' end
-  if path == '' and (eventName == 'real_yawrate' or eventName == 'ideal_yawrate') then return 'rad/s' end
-  return ''
+local function registerField(identity, eventName, path, source)
+  local key = JSON.stringify({identity, path})
+  local id = fieldIDs[key]
+  if id then return id end
+  local name, unit = TelemetryNames.describe(eventName, path)
+  local err
+  id, err = session:addField({name = name, unit = unit,
+    event = eventName, path = path, source = source})
+  if not id then reportError(err); return nil end
+  fieldIDs[key] = id
+  return id
+end
+
+local function registerKnownSource(identity, source)
+  if knownSources[identity] then return true end
+  -- Reserve every expected channel in contract order, even if its value remains
+  -- unavailable throughout this session (for example, CG sideslip while stopped).
+  for i = 1, #Channels.fields do
+    local path = TelemetryNames.pathForKey(Channels.fields[i].name)
+    if not registerField(identity, Channels.eventName, path, source) then return false end
+  end
+  knownSources[identity] = true
+  return true
 end
 
 local function receiveEvent(eventName, data, senderName, senderType, senderID)
@@ -78,26 +90,22 @@ local function receiveEvent(eventName, data, senderName, senderType, senderID)
   local source = {name = tostring(senderName or ''), type = tostring(senderType or ''),
     id = tostring(senderID or '')}
   local identity = JSON.stringify({eventName, source.type, source.id, source.name})
+  if eventName == Channels.eventName and not registerKnownSource(identity, source) then return end
   local previous = pending[identity]
   local packet = {values = {}, received = os.preciseClock() - session.startedWall,
     counts = previous and previous.counts or {}}
   local fields = TelemetryFields.flatten(data)
   for i = 1, #fields do
     local field = fields[i]
-    local fieldKey = JSON.stringify({identity, field.path})
-    local id = fieldIDs[fieldKey]
-    if not id then
-      local name = 'Telemetry[' .. JSON.stringify(eventName) .. ']' .. field.path
-        .. ' @' .. JSON.stringify({source.type, source.id, source.name})
-      local err
-      id, err = session:addField({name = name, unit = knownUnit(eventName, field.path),
-        event = eventName, path = field.path, source = source})
-      if not id then reportError(err); return end
-      fieldIDs[fieldKey] = id
+    -- An empty/nil/invalid contract packet contains no telemetry channel. Keep
+    -- its expected columns missing without inventing an empty-table diagnostic.
+    if eventName ~= Channels.eventName or field.path ~= '' then
+      local id = registerField(identity, eventName, field.path, source)
+      if not id then return end
+      local idKey = tostring(id)
+      packet.counts[idKey] = (packet.counts[idKey] or 0) + 1
+      packet.values[idKey] = {kind = field.kind, value = valueText(field), updates = packet.counts[idKey]}
     end
-    local idKey = tostring(id)
-    packet.counts[idKey] = (packet.counts[idKey] or 0) + 1
-    packet.values[idKey] = {kind = field.kind, value = valueText(field), updates = packet.counts[idKey]}
   end
   -- Replace the WHOLE payload. A field removed from a later packet is immediately absent.
   pending[identity] = packet
@@ -118,13 +126,6 @@ local function nativeValues(car, sampleTime)
   append(pos and pos.x); append(pos and pos.y); append(pos and pos.z)
   local acc = car.acceleration
   append(acc and acc.z); append(acc and acc.x); append(acc and acc.y)
-  local wheels = car.physicsAvailable and car.wheels or nil
-  for _, key in ipairs({'fx', 'fy', 'load'}) do
-    for i = 0, 3 do
-      local wheel = wheels and wheels[i]
-      append(wheel and wheel[key])
-    end
-  end
   return values
 end
 
@@ -134,7 +135,7 @@ local function startRecording()
   local ok, err = nextSession:start()
   if not ok then reportError(err); return end
   session = nextSession
-  pending, fieldIDs = {}, {}
+  pending, fieldIDs, knownSources = {}, {}, {}
   elapsed, nextSampleIndex, missedSamples = 0, 1, 0
   lastPhysicsTimestamp, lastError, reportedError = nil, nil, nil
   recoveryPath = session.journalPath
@@ -254,15 +255,17 @@ function script.windowMain(dt)
         .. 'Dynamic runtime-generated event names and aliases need an explicit discoverable broadcast. '
         .. 'No ECU or controller files are changed.\n\n'
         .. 'Stop produces one CSV with the union of all recorded fields. '
-        .. 'Each custom field has value, type, reception wall time and update count columns. '
-        .. 'A sample without a new packet is marked missing; values are not carried forward. '
+        .. 'CSV contains one value column per channel; types, reception times, update counts and sources remain in the journal. '
+        .. 'A sample without a new packet is blank; values are not carried forward. '
+        .. 'VehicleTelemetry channels follow the shared contract order FL, FR, RL, RR, with readable names and units. '
+        .. 'All contract columns are reserved when their sender is first received, including unavailable values. '
         .. 'Numbers, booleans, strings, tables and CSP vectors are supported. '
-        .. 'Invalid values and unsupported structures have explicit type/status markers.\n\n'
-        .. '50 Hz is a frame-limited target. Actual simulation sample times are in Time. '
+        .. 'Invalid values and unsupported structures have explicit type/status markers in the journal.\n\n'
+        .. '50 Hz is a frame-limited target. Actual simulation sample times are in time_s. '
         .. 'Multiple updates within one sample are reduced to the latest packet; '
         .. 'the per-field update count describes how many arrivals contained that field. Reception time is not ECU generation time. '
         .. 'Paused simulation and replays are excluded. New event discovery may take one scan cycle. '
-        .. 'Position is world XYZ; Acc XYZ is longitudinal/lateral/vertical in g. '
+        .. 'Position is world XYZ; acceleration is longitudinal/lateral/vertical in g. '
         .. 'Torque is a motor-shaft command. Unknown custom units are left unspecified.')
     end)
     ui.tabItem('Recovery', function()
@@ -275,7 +278,7 @@ function script.windowMain(dt)
           local ok, err = recoveredSession:recover(recoveryPath)
           if ok then
             session = recoveredSession
-            pending, fieldIDs = {}, {}
+            pending, fieldIDs, knownSources = {}, {}, {}
             lastError, reportedError = nil, nil
           else reportError(err) end
         end
