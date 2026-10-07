@@ -56,7 +56,8 @@ end
 
 local function sessionOptions()
   return {baseColumns = baseColumns, sampleRate = sampleRate,
-    carName = ac.getCarName(0) or 'Unknown', driverName = os.getenv('USERNAME') or 'Unknown'}
+    carName = ac.getCarName(0) or 'Unknown', driverName = os.getenv('USERNAME') or 'Unknown',
+    bodyFrame = Channels.bodyFrame, anglePositive = Channels.anglePositive}
 end
 
 local function registerField(identity, eventName, path, source)
@@ -265,7 +266,12 @@ function script.windowMain(dt)
         .. 'Multiple updates within one sample are reduced to the latest packet; '
         .. 'the per-field update count describes how many arrivals contained that field. Reception time is not ECU generation time. '
         .. 'Paused simulation and replays are excluded. New event discovery may take one scan cycle. '
-        .. 'Position is world XYZ; acceleration is longitudinal/lateral/vertical in g. '
+        .. 'Body axes are X=forward, Y=left, Z=up; body acceleration uses these axes in g. '
+        .. 'Planar angles, yaw and steering are positive counterclockwise viewed from above. '
+        .. 'Position remains fixed AC world XYZ, never rotated into the body frame. '
+        .. 'Wheel longitudinal/lateral forces are positive forward/left; wheel slip is the negative of AC solver slipAngle. '
+        .. 'Wheel slip retains the solver low-speed relaxation and reverse-driving convention; it is not a full-range velocity angle. '
+        .. 'CG sideslip is atan2(body velocity Y, body velocity X), unavailable below 0.1 m/s. '
         .. 'Torque is a motor-shaft command. Unknown custom units are left unspecified.')
     end)
     ui.tabItem('Recovery', function()

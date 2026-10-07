@@ -1,12 +1,15 @@
 -- Shared sender/recorder contract. This file contains column definitions only;
 -- it is not a telemetry payload. Keep the recorder copy identical.
 local channels = {eventName = 'VehicleTelemetry', fields = {}, byName = {}}
+channels.bodyFrame = 'X_forward_Y_left_Z_up'
+channels.anglePositive = 'counterclockwise_viewed_from_above'
 channels.baseColumns = {
   {'time_s', 's'}, {'speed_kmh', 'km/h'}, {'steering_angle_deg', 'deg'},
   {'throttle_pct', '%'}, {'brake_pct', '%'}, {'clutch_pct', '%'},
-  {'position_world_x_m', 'm'}, {'position_world_y_m', 'm'}, {'position_world_z_m', 'm'},
-  {'acceleration_longitudinal_g', 'g'}, {'acceleration_lateral_g', 'g'},
-  {'acceleration_vertical_g', 'g'}
+  -- World position is a fixed track frame, not the rotating vehicle frame.
+  {'position_ac_world_x_m', 'm'}, {'position_ac_world_y_m', 'm'}, {'position_ac_world_z_m', 'm'},
+  {'acceleration_body_x_g', 'g'}, {'acceleration_body_y_g', 'g'},
+  {'acceleration_body_z_g', 'g'}
 }
 
 local function add(name, unit)
@@ -22,11 +25,12 @@ add('motor_ctrl_mode', '')
 add('yaw_rate_actual_radps', 'rad/s')
 add('yaw_rate_target_radps', 'rad/s')
 for _, wheel in ipairs({'FL', 'FR', 'RL', 'RR'}) do
-  -- The original AC raw tyre channels retain their original signs and meaning.
-  add(wheel .. '_tyre_fx_raw_N', 'N')
-  add(wheel .. '_tyre_fy_raw_N', 'N')
+  -- Wheel contact directions: forward rolling direction, left tangent, road normal.
+  -- These preserve the original quantities while normalizing their signs.
+  add(wheel .. '_tyre_force_longitudinal_N', 'N')
+  add(wheel .. '_tyre_force_lateral_N', 'N')
   add(wheel .. '_tyre_normal_load_N', 'N')
-  -- Physical chassis basis: X=side, Y=up, Z=look (forward).
+  -- User body basis: X=forward, Y=left, Z=up (right-handed).
   add(wheel .. '_tyre_force_body_x_N', 'N')
   add(wheel .. '_tyre_force_body_y_N', 'N')
   add(wheel .. '_tyre_force_body_z_N', 'N')

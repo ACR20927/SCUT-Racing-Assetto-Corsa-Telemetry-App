@@ -238,6 +238,11 @@ function Session:start()
   if self.exporting then return false, 'Wait for the current CSV export to finish' end
   local closed, closeErr = self:_closeHandles()
   if not closed then return self:_fail('Could not close previous files: ' .. closeErr) end
+  for _, key in ipairs({'bodyFrame', 'anglePositive'}) do
+    if self.options[key] ~= nil and type(self.options[key]) ~= 'string' then
+      return self:_fail('Optional ' .. key .. ' metadata must be a string')
+    end
+  end
   self.error, self.complete, self.recovered, self.recoveryNotice = nil, false, false, nil
   self.dataCount, self.exportedRows, self._lastTime, self.duration = 0, 0, nil, 0
   self._ignoredTail = nil
@@ -263,7 +268,8 @@ function Session:start()
   self.metadata = {format = FORMAT, version = VERSION, baseColumns = self.baseColumns,
     sampleRate = self.sampleRate, carName = tostring(self.options.carName or 'Unknown'),
     driverName = tostring(self.options.driverName or 'Unknown'),
-    date = os.date('%Y-%m-%d'), startTime = os.date('%H:%M:%S')}
+    date = os.date('%Y-%m-%d'), startTime = os.date('%H:%M:%S'),
+    bodyFrame = self.options.bodyFrame, anglePositive = self.options.anglePositive}
   local wrote, writeErr = self:_writeRecord({type = 'header', metadata = self.metadata})
   if not wrote then return false, writeErr end
   local flushed, flushErr = fileCall(self._journal, 'flush')
@@ -346,13 +352,33 @@ end
 
 function Session:_writeCSVHeader()
   local metadata = self.metadata
+  local frameComment
+  if metadata.bodyFrame == 'X_forward_Y_left_Z_up' then
+    frameComment = 'Body axes: X=forward, Y=left, Z=up (right-handed). '
+      .. 'Body acceleration and force/moment components use these axes. '
+      .. 'Wheel longitudinal/lateral forces are positive forward/left. '
+      .. 'Wheel slip is the negative of AC solver slipAngle in radians, retaining its low-speed relaxation and reverse-driving convention; '
+      .. 'it is not a full-range velocity angle. CG sideslip is atan2(body velocity Y, body velocity X), unavailable below 0.1 m/s. '
+  elseif metadata.bodyFrame ~= nil and metadata.bodyFrame ~= '' then
+    frameComment = 'Recorded body frame: ' .. metadata.bodyFrame .. '. Recovery does not change its components. '
+  else
+    frameComment = 'Body frame is unspecified in this journal; recovery does not infer or change it. '
+  end
+  if metadata.anglePositive == 'counterclockwise_viewed_from_above' then
+    frameComment = frameComment .. 'Planar angles, yaw and steering are positive counterclockwise viewed from above. '
+  elseif metadata.anglePositive ~= nil and metadata.anglePositive ~= '' then
+    frameComment = frameComment .. 'Recorded angular sign convention: ' .. metadata.anglePositive .. '. '
+  else
+    frameComment = frameComment .. 'Angular sign convention is unspecified in this journal. '
+  end
   local comment = 'Target ' .. tostring(metadata.sampleRate) .. ' Hz; frame-driven irregular simulation '
     .. self.baseColumns[1].name .. '; '
     .. 'no fabricated catch-up rows. Dynamic values are arrivals since the preceding sample, not held values. '
     .. 'CSV contains one value column per channel; missing or nil values are blank, true zero remains zero. '
     .. 'Types, receiver wall-clock timestamps, per-field arrival counts and sender identities are retained in the journal. '
     .. 'Receiver timestamps are not ECU generation times. Unknown custom units are unspecified. '
-    .. 'Pos is world XYZ in metres. Acc XYZ is longitudinal/lateral/vertical in g. '
+    .. 'Position remains fixed AC world XYZ in metres; it is not rotated into the vehicle frame. '
+    .. frameComment
     .. 'All dynamic fields discovered during this recording are included in this header.'
   if self.recoveryNotice then comment = comment .. ' ' .. self.recoveryNotice end
   local rows = {
@@ -450,7 +476,9 @@ function Session:_consumeRecord(record)
     local m = record.metadata
     if m.format ~= FORMAT or m.version ~= VERSION or not finite(m.sampleRate) or m.sampleRate <= 0
         or type(m.carName) ~= 'string' or type(m.driverName) ~= 'string'
-        or type(m.date) ~= 'string' or type(m.startTime) ~= 'string' then
+        or type(m.date) ~= 'string' or type(m.startTime) ~= 'string'
+        or (m.bodyFrame ~= nil and type(m.bodyFrame) ~= 'string')
+        or (m.anglePositive ~= nil and type(m.anglePositive) ~= 'string') then
       return false, 'Invalid journal metadata'
     end
     if self._phase == 'scan' then
@@ -458,6 +486,9 @@ function Session:_consumeRecord(record)
       if not ok then return false, err end
       self.metadata, self.sampleRate = m, m.sampleRate
     else
+      if m.bodyFrame ~= self.metadata.bodyFrame or m.anglePositive ~= self.metadata.anglePositive then
+        return false, 'Journal frame/sign metadata changed during export'
+      end
       local columns, err = copyColumns(m.baseColumns)
       if not columns then return false, err end
       if #columns ~= #self.baseColumns then return false, 'Journal base schema changed' end

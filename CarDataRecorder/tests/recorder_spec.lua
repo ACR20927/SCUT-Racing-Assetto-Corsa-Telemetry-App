@@ -6,7 +6,7 @@ local ffi = require('ffi')
 ffi.cdef[[int mkdir(const char *path, unsigned int mode); int access(const char *path, int mode);]]
 
 local pluginRoot = arg[1] or '/home/baizhu945/Documents/ACCarModel/SCUT-Racing-Assetto-Corsa-Telemetry-App/CarDataRecorder'
-local outputRoot = arg[2] or '/home/baizhu945/Documents/Codex/2026-10-05/wo-d/work/ac-repair/telemetry-clean-tests'
+local outputRoot = arg[2] or '/home/baizhu945/Documents/Codex/2026-10-05/wo-d/work/ac-repair/telemetry-user-frame-tests'
 local senderRoot = arg[3] or '/home/baizhu945/Documents/ACCarModel/script'
 local stdOpen = io.open
 local checks, cases = 0, {}
@@ -217,7 +217,11 @@ local function parseCSV(text)
       data[#data + 1] = rows[j]
     end
   end
-  return {header = header, units = units, rows = data, index = index}
+  local metadata = {}
+  for j = 1, headerIndex - 1 do
+    if #rows[j] == 2 then metadata[rows[j][1]] = rows[j][2] end
+  end
+  return {header = header, units = units, rows = data, index = index, metadata = metadata}
 end
 local function csv(session) return parseCSV(readNative(session.filePath)) end
 local function value(tableCSV, row, name) return tableCSV.rows[row][assert(tableCSV.index[name], name)] end
@@ -266,16 +270,16 @@ near(default.duration, 0.18, 'recording duration excludes pause')
 near(tonumber(value(baseline, 4, 'time_s')), 0.18, 'large-dt row uses its true time')
 local expected = {
   {'time_s','s'}, {'speed_kmh','km/h'}, {'steering_angle_deg','deg'}, {'throttle_pct','%'},
-  {'brake_pct','%'}, {'clutch_pct','%'}, {'position_world_x_m','m'}, {'position_world_y_m','m'},
-  {'position_world_z_m','m'}, {'acceleration_longitudinal_g','g'}, {'acceleration_lateral_g','g'},
-  {'acceleration_vertical_g','g'}
+  {'brake_pct','%'}, {'clutch_pct','%'}, {'position_ac_world_x_m','m'}, {'position_ac_world_y_m','m'},
+  {'position_ac_world_z_m','m'}, {'acceleration_body_x_g','g'}, {'acceleration_body_y_g','g'},
+  {'acceleration_body_z_g','g'}
 }
 for _, wheel in ipairs({'FL','FR','RL','RR'}) do expected[#expected + 1] = {wheel .. '_motor_torque_command_Nm','N*m'} end
 for _, field in ipairs({{'motor_ctrl_mode',''}, {'yaw_rate_actual_radps','rad/s'}, {'yaw_rate_target_radps','rad/s'}}) do
   expected[#expected + 1] = field
 end
 for _, wheel in ipairs({'FL','FR','RL','RR'}) do
-  for _, field in ipairs({{'tyre_fx_raw_N','N'}, {'tyre_fy_raw_N','N'}, {'tyre_normal_load_N','N'},
+  for _, field in ipairs({{'tyre_force_longitudinal_N','N'}, {'tyre_force_lateral_N','N'}, {'tyre_normal_load_N','N'},
       {'tyre_force_body_x_N','N'}, {'tyre_force_body_y_N','N'}, {'tyre_force_body_z_N','N'}, {'tyre_slip_angle_rad','rad'}}) do
     expected[#expected + 1] = {wheel .. '_' .. field[1], field[2]}
   end
@@ -305,10 +309,25 @@ equal(value(baseline, 1, 'yaw_rate_target_radps'), '0', 'real yaw zero stays zer
 for row = 1, #baseline.rows do equal(value(baseline, row, 'cg_sideslip_estimate_rad'), '', 'CG unavailable all session') end
 for col = 13, 54 do equal(baseline.rows[2][col], '', 'no new packet means blank, never held value') end
 equal(value(baseline, 1, 'steering_angle_deg'), '8', 'native steering sign')
-near(tonumber(value(baseline, 1, 'acceleration_longitudinal_g')), 0.4, 'native longitudinal acceleration')
-near(tonumber(value(baseline, 1, 'acceleration_lateral_g')), 0.2, 'native lateral acceleration')
-near(tonumber(value(baseline, 1, 'acceleration_vertical_g')), 0.3, 'native vertical acceleration')
-pass('default 54 readable channels, unavailable CG, units, real zeros, pause and low-frame-rate sampling')
+near(tonumber(value(baseline, 1, 'acceleration_body_x_g')), 0.4, 'body X acceleration is AC forward z without another sign flip')
+near(tonumber(value(baseline, 1, 'acceleration_body_y_g')), 0.2, 'body Y acceleration is AC left x without another sign flip')
+near(tonumber(value(baseline, 1, 'acceleration_body_z_g')), 0.3, 'body Z acceleration is AC upward y without another sign flip')
+near(tonumber(value(baseline, 1, 'position_ac_world_x_m')), 1, 'fixed AC world X position is not rotated')
+near(tonumber(value(baseline, 1, 'position_ac_world_y_m')), -2, 'fixed AC world Y position is not permuted or negated')
+near(tonumber(value(baseline, 1, 'position_ac_world_z_m')), 3, 'fixed AC world Z position is not rotated')
+near(tonumber(value(baseline, 1, 'yaw_rate_actual_radps')), packet.yaw_rate_actual_radps, 'positive actual yaw is preserved')
+equal(Channels.bodyFrame, 'X_forward_Y_left_Z_up', 'shared contract declares the user body frame')
+equal(Channels.anglePositive, 'counterclockwise_viewed_from_above', 'shared contract declares CCW-positive angles')
+local baselineRecords = journal(default.journalPath)
+equal(baselineRecords[1].metadata.bodyFrame, Channels.bodyFrame, 'journal stores the recording body frame')
+equal(baselineRecords[1].metadata.anglePositive, Channels.anglePositive, 'journal stores the angle convention')
+equal(#baseline.header, 54, 'frame metadata adds no CSV columns')
+check(baseline.metadata.Comment:find('Body axes: X=forward, Y=left, Z=up', 1, true), 'CSV Comment declares user body axes')
+check(baseline.metadata.Comment:find('counterclockwise viewed from above', 1, true), 'CSV Comment declares CCW-positive angles')
+check(baseline.metadata.Comment:find('Wheel longitudinal/lateral forces are positive forward/left', 1, true), 'CSV Comment declares wheel force directions')
+check(baseline.metadata.Comment:find('negative of AC solver slipAngle', 1, true), 'CSV Comment distinguishes normalized solver slip')
+check(baseline.metadata.Comment:find('Position remains fixed AC world XYZ', 1, true), 'CSV Comment keeps world position separate')
+pass('default 54 readable channels, user body axes/sign metadata, unchanged world/steering/yaw values and sampling')
 
 -- A complete application recording with changing packet shape and sender identity.
 local dynamic = start('dynamic-fields')
@@ -421,6 +440,50 @@ near(recovered.duration, dynamic.duration, 'recovery preserves true duration for
 check(recovered.recoveryNotice and recovered.recoveryNotice:find('finalized', 1, true), 'finished recovery is labelled')
 pass('complete journal -> real recovery UI -> numerically identical single-value CSV')
 
+local function encodeJournalRecord(record)
+  local payload = JSON.stringify(record)
+  local a, b = 1, 0
+  for i = 1, #payload do a = (a + payload:byte(i)) % 65521; b = (b + a) % 65521 end
+  return JSON.stringify({version = 1, checksum = string.format('%.0f', b * 65536 + a), payload = payload})
+end
+local function writeJournalFixture(path, records)
+  local lines = {}
+  for i = 1, #records do lines[i] = encodeJournalRecord(records[i]) end
+  writeNative(path, table.concat(lines, '\n') .. '\n')
+end
+
+-- Old schema records remain valid without optional coordinate/sign metadata.
+local oldRecords = JSON.parse(JSON.stringify(dynamicRecords))
+oldRecords[1].metadata.bodyFrame, oldRecords[1].metadata.anglePositive = nil, nil
+local oldPath = outputRoot .. '/legacy-no-frame.journal.jsonl'
+writeJournalFixture(oldPath, oldRecords)
+local oldRecovered = recover(oldPath)
+check(oldRecovered.complete and not oldRecovered.error, 'legacy journal without optional frame metadata recovers')
+local oldCSV = csv(oldRecovered)
+sameCSV(changed, oldCSV)
+check(oldCSV.metadata.Comment:find('Body frame is unspecified', 1, true), 'legacy recovery discloses unspecified body frame')
+check(oldCSV.metadata.Comment:find('Angular sign convention is unspecified', 1, true), 'legacy recovery discloses unspecified angle sign')
+check(not oldCSV.metadata.Comment:find('X=forward, Y=left, Z=up', 1, true), 'legacy recovery does not falsely declare the new body axes')
+check(not oldCSV.metadata.Comment:find('counterclockwise viewed from above', 1, true), 'legacy recovery does not invent the new angular sign')
+check(oldRecovered.metadata.bodyFrame == nil and oldRecovered.metadata.anglePositive == nil, 'legacy metadata remains absent after recovery')
+pass('legacy journal without coordinate/sign metadata recovers without relabelling or transforming data')
+
+-- Optional metadata must still be a string when explicitly supplied.
+for _, key in ipairs({'bodyFrame', 'anglePositive'}) do
+  local invalidOptions = {baseColumns = Channels.baseColumns, sampleRate = 50, [key] = false}
+  local invalidSession = CsvSession.new(invalidOptions)
+  local ok, err = invalidSession:start()
+  check(not ok and err:find(key, 1, true), 'start rejects invalid optional ' .. key .. ' metadata')
+  local badRecords = JSON.parse(JSON.stringify(dynamicRecords))
+  badRecords[1].metadata[key] = false
+  local badPath = outputRoot .. '/invalid-' .. key .. '.journal.jsonl'
+  writeJournalFixture(badPath, badRecords)
+  local badRecovered = recover(badPath)
+  check(not badRecovered.complete and badRecovered.error and not badRecovered.exporting, 'recovery rejects invalid optional ' .. key .. ' metadata')
+  check(not io.exists(badRecovered.filePath), 'invalid optional metadata does not publish CSV')
+end
+pass('optional body-frame and angle-sign metadata type validation at recording and recovery')
+
 local _, rawLines = journal(dynamic.journalPath)
 local lastSample
 for i = #dynamicRecords, 1, -1 do if dynamicRecords[i].type == 'sample' then lastSample = i; break end end
@@ -456,6 +519,7 @@ for name, before in pairs(productionBefore) do equal(readNative(pluginRoot .. '/
 local report = {checks = checks, cases = cases, status = 'PASS', gameLaunched = false,
   defaultColumns = #baseline.header, defaultRows = #baseline.rows, dynamicRows = #changed.rows,
   genuine50HzRows = 50, recoveryEquivalent = true, truncatedTailRows = #changed.rows - 1,
-  middleCorruptionRejected = true, outputRoot = outputRoot}
+  middleCorruptionRejected = true, legacyFrameUnspecified = true, bodyFrame = Channels.bodyFrame,
+  anglePositive = Channels.anglePositive, outputRoot = outputRoot}
 writeNative(outputRoot .. '/report.json', JSON.stringify(report) .. '\n')
 print(string.format('PASS all %d integration cases, %d checks; production files unchanged; game not launched', #cases, checks))
